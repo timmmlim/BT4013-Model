@@ -213,27 +213,25 @@ def mySettings():
 
     settings = {}
 
-    # S&P 100 stocks
-    settings['markets']=['CASH','AAPL','ABBV','ABT','ACN','AEP','AIG','ALL',
-    'AMGN','AMZN','APA','APC','AXP','BA','BAC','BAX','BK','BMY','BRKB','C',
-    'CAT','CL','CMCSA','COF','COP','COST','CSCO','CVS','CVX','DD','DIS','DOW',
-    'DVN','EBAY','EMC','EMR','EXC','F','FB','FCX','FDX','FOXA','GD','GE',
-    'GILD','GM','GOOGL','GS','HAL','HD','HON','HPQ','IBM','INTC','JNJ','JPM',
-    'KO','LLY','LMT','LOW','MA','MCD','MDLZ','MDT','MET','MMM','MO','MON',
-    'MRK','MS','MSFT','NKE','NOV','NSC','ORCL','OXY','PEP','PFE','PG','PM',
-    'QCOM','RTN','SBUX','SLB','SO','SPG','T','TGT','TWX','TXN','UNH','UNP',
-    'UPS','USB','UTX','V','VZ','WAG','WFC','WMT','XOM']
-
     # Futures Contracts
+    settings['markets'] = ['F_AD','F_BO','F_BP','F_C','F_CC','F_CD','F_CL','F_CT','F_DX','F_EC',
+                           'F_ED','F_ES','F_FC','F_FV','F_GC','F_HG','F_HO','F_JY','F_KC','F_LB',
+                           'F_LC','F_LN','F_MD','F_MP','F_NG','F_NQ','F_NR','F_O','F_OJ','F_PA',
+                           'F_PL','F_RB','F_RU','F_S','F_SB','F_SF','F_SI','F_SM','F_TU','F_TY','F_US',
+                           'F_W','F_XX','F_YM','F_AX','F_CA','F_DT','F_UB','F_UZ','F_GS','F_LX','F_SS','F_DL',
+                           'F_ZQ','F_VX','F_AE','F_BG','F_BC','F_LU','F_DM','F_AH','F_CF','F_DZ','F_FB','F_FL',
+                           'F_FM','F_FP','F_FY','F_GX','F_HP','F_LR','F_LQ','F_ND','F_NY','F_PQ','F_RR','F_RF','F_RP',
+                           'F_RY','F_SH','F_SX','F_TR','F_EB','F_VF','F_VT','F_VW','F_GD','F_F']
+
     # settings['markets'] = ['CASH', 'F_TU', 'F_FV', 'F_TY', 'F_NQ', 'F_US']
 
     settings['lookback'] = 504
     settings['budget'] = 10**6
     settings['slippage'] = 0.05
-    settings['beginInSample'] = '20171017'
+    settings['beginInSample'] = '20171017'  # backtesting starts settings[lookback] days after period
     settings['endInSample'] = '20200131'
 
-    settings['threshold'] = 0.01
+    settings['threshold'] = 0.01  # probably need to set lower, since the forecasted values are all close to 0
     settings["TradingDay"] = 0
     settings["TrainedCounts"] = 0
     settings["curr_best_arima_model"] = {}
