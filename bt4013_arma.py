@@ -30,90 +30,92 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
 
     ############################################## DECLARE FUNCTIONS ################################################
 
-    def get_best_p_q(test_results={}, best_model_criteria="BIC"):
-        # get the best p and best q
+    def get_best_p_d_q(test_results={}, best_model_criteria="BIC"):
+        # convert to dataframe
         test_results_df = pd.DataFrame(test_results).T
-        
-        test_results_df.columns = ['RMSE', 'AIC',
-                                'BIC', 'convergence', 'stationarity']
-        test_results_df.index.names = ['p', 'q']
-        test_results_df = test_results_df.reset_index(level=[0,1])
-        # print(f'test_results_df:{test_results_df}')
-        index = np.argmin(
-            test_results_df[best_model_criteria])
+        test_results_df.columns = ['AIC', 'BIC', 'convergence', 'stationarity']
+        test_results_df.index.names = ['p', 'd', 'q']
+        test_results_df = test_results_df.reset_index()
+
+        # find p,d,q that gives the minimum criteria
+        index = np.argmin(test_results_df[best_model_criteria])
         best_p = test_results_df.iloc[index]['p']
+        best_d = test_results_df.iloc[index]['d']
         best_q = test_results_df.iloc[index]['q']
-        # return integer values
-        return int(best_p), int(best_q)
 
-    # Data consists of 504 days over here, automatically replaced by runts
-    def re_train_model(data,
-                       train_size,
-                       max_p=5,
-                       max_q=5):
+        return int(best_p), int(best_d), int(best_q)
+    
+    def get_best_q(test_results={}, best_model_criteria="BIC"):
+        # helper function to get best order for ARCH model
+        # convert to dataframe
+        test_results_df = pd.DataFrame(test_results).T
+        test_results_df.columns = ['AIC', 'BIC']
+        test_results_df.index.names = ['q']
+        test_results_df = test_results_df.reset_index()
+
+        # find p,d,q that gives the minimum criteria
+        index = np.argmin(test_results_df[best_model_criteria])
+        best_q = test_results_df.iloc[index]['q']
+
+        return int(best_q)
+
+    def get_best_arima_model(data, max_p=3, max_d=2, max_q=3, criteria="BIC"):
         """
 
-        We can look back 504 days
-        if train_size = 400 with rolling window of step size 1 means:
-        For each p:q, we have (504 - 400) = 104 prediction -> 104 models for validation 
+        helper function to find the best order for our model
 
         """
-        import warnings
-        warnings.simplefilter('ignore')
         # test results to keep track of the metrics
         test_results = {}
-        # this is for test data, so not wrong to do it here
-        y_true = data.iloc[train_size:]
         
-        # try 3 x 3 because prof said any order more than 2 is suspicious already
+        # iterate through range of possible orders
         for p in range(max_p):
             for q in range(max_q):
-                # print(f"P,Q:{p,q}")
-                aic, bic = [], []
-                if p == 0 and q == 0:
-                    continue
-                convergence_error = stationarity_error = 0
-                y_pred = []
-                for T in range(train_size, len(data)):  # step size 1
-                    # print(f'len(data):{len(data)}')
-                    train_set = data.iloc[T-train_size:T]
+                for d in range(max_d):
+                    print(f"p, d, q: {p, d, q}")
+                    aic, bic = [], []
+                    if p == 0 and q == 0:
+                        continue
+                    convergence_error = stationarity_error = 0
+    
                     try:
-                        model = tsa.ARMA(endog=train_set, order=(p, q)).fit(optimized=False)
+                        model = tsa.ARIMA(endog=data, order=(p, d, q)).fit(optimized=False)
                     except LinAlgError:
                         convergence_error += 1
                     except ValueError:
                         stationarity_error += 1
-
-                    forecast, _, _ = model.forecast(steps=1)
-                    y_pred.append(forecast[0])
-                    aic.append(model.aic)
-                    bic.append(model.bic)
-
-                result = (pd.DataFrame({'y_true': y_true, 'y_pred': y_pred})
-                          .replace(np.inf, np.nan)
-                          .dropna())
+    
+                    aic = model.aic
+                    bic = model.bic
                 
-                # i think shouldn't use future predictions to evaluate model RMSE
-                # AIC/BIC is evaluating how well the model fits on the train data
-                rmse = np.sqrt(mean_squared_error(
-                    y_true=result.y_true, y_pred=result.y_pred))
-
-                test_results[(p, q)] = [rmse,
-                                        np.mean(aic),
-                                        np.mean(bic),
-                                        convergence_error,
-                                        stationarity_error]
-        # Set model selection criteria
-        best_model_criteria = "BIC"
+                    test_results[(p, d, q)] = [aic,
+                                               bic,
+                                               convergence_error,
+                                               stationarity_error]
         # Get the best order
-        best_p, best_q = get_best_p_q(test_results=test_results,
-                                      best_model_criteria=best_model_criteria)
-        
-        print(f"Best p: {best_p}, Best q: {best_q}")
+        best_p, best_d, best_q = get_best_p_d_q(test_results=test_results,
+                                      best_model_criteria=criteria)
+        print(f"Best p: {best_p}, Best d: {best_d}, Best q: {best_q}")
         
         # Fit ARMA with best order
         best_model = tsa.ARMA(endog=data, order=(best_p, best_q)).fit()
         print(f"Model Params: {best_model.params}")
+        
+        return best_model
+    
+    def get_best_arch_model(arima_model, max_q=3):
+        test_results = {}
+        for q in range(max_q):
+            model = arch_model(arima_model.resid, q=q, vol='ARCH').fit()
+            
+            aic = model.aic
+            bic = model.bic
+            
+            test_results[q] = [aic, bic]
+            
+        # get best order
+        best_q = get_best_q(test_results, best_model_criteria='BIC')
+        best_model = arch_model(arima_model.resid, q=best_q, vol='ARCH').fit()
         
         return best_model
  ############################################## END DECLARE FUNCTIONS ################################################
@@ -131,10 +133,9 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
     for i, market in enumerate(markets):
 
         ##### i converted the prices to pandas, because i find it easier to work with, not sure if it slows down the shit #####
-
         try:
-            CURR_CLOSE = pd.Series(CLOSE[:, i]).dropna()
-
+            # only use most recent year of data
+            CURR_CLOSE = pd.Series(CLOSE[-252:, i]).dropna()
             DAILY_RETURN = CURR_CLOSE.pct_change().dropna()
 
             # calculate log returns
@@ -148,16 +149,29 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
                 train_size = 450
                 max_p = 3
                 max_q = 3
-
-                best_model = re_train_model(data=LOG_DAILY_RETURN, # LOG_RETURN IS SERIES
-                                            train_size=train_size,
+                max_d = 3
+                
+                arima_model = get_best_arima_model(data=LOG_DAILY_RETURN, # LOG_RETURN IS SERIES
                                             max_p=max_p,
+                                            max_d=max_d,
                                             max_q=max_q)
                 
-                # forecast the results for the next 20 days
-                forecast_next_20 = best_model.forecast(steps=20)[0]
-                settings['forecasted_returns'][market] = forecast_next_20                
-                print(f'Forecasted returns for {market}: {forecast_next_20}')
+                ARCH_model = get_best_arch_model(arima_model)
+                
+                # forecast the results for the next 20 days           
+                # https://arch.readthedocs.io/en/latest/univariate/univariate_volatility_forecasting.html
+                # i think this returns the mean of the forecast for the ARIMA + ARCH model
+                arch_forecast = ARCH_model.forecast(horizon=20).mean.iloc[-1]
+                print(f'ARCH forecast for mean: {arch_forecast}')
+                # settings['forecasted_returns'][market] = arch_forecast                
+
+                # combine both predictions
+                mu_pred = arima_model.forecast(steps=20)[0]
+                var_pred = ARCH_model.forecast(horizon=20).variance.iloc[-1]
+                forward_20_forecast = mu_pred + var_pred  # very bullish since we assume thatprice will vary upwards only lol
+                settings['forecasted_returns'][market] = forward_20_forecast
+                print(f'variance prediction for {market}: {var_pred}')
+                print(f'Forecasted returns for {market}: {forward_20_forecast}')
                 
             # get the forecasts from the model
             model_forecast = settings['forecasted_returns'][market][traded_days_count % 20]
@@ -196,7 +210,8 @@ def mySettings():
     # 'UPS','USB','UTX','V','VZ','WAG','WFC','WMT','XOM']
 
     # Futures Contracts
-    settings['markets'] = ['CASH', 'F_TU', 'F_FV', 'F_TY', 'F_NQ', 'F_US']
+    # settings['markets'] = ['CASH', 'F_TU', 'F_FV', 'F_TY', 'F_NQ', 'F_US']
+    settings['markets'] = ['F_NQ']
 
     settings['lookback'] = 504
     settings['budget'] = 10**6
