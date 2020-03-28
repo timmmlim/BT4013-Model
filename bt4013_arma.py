@@ -73,21 +73,20 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
             for q in range(max_q):
                 for d in range(max_d):
                     print(f"p, d, q: {p, d, q}")
-                    aic, bic = [], []
+                    aic, bic = 10000, 10000
                     if p == 0 and q == 0:
                         continue
                     convergence_error = stationarity_error = 0
     
                     try:
                         model = tsa.ARIMA(endog=data, order=(p, d, q)).fit(optimized=False)
+                        aic = model.aic
+                        bic = model.bic
                     except LinAlgError:
                         convergence_error += 1
                     except ValueError:
                         stationarity_error += 1
-    
-                    aic = model.aic
-                    bic = model.bic
-                
+
                     test_results[(p, d, q)] = [aic,
                                                bic,
                                                convergence_error,
@@ -141,8 +140,8 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
             # calculate log returns
             LOG_DAILY_RETURN = np.log(DAILY_RETURN + 1)
             
-            # retrain our model every 20 days
-            if traded_days_count % 20 == 0:
+            retrain_period = 10  # period to retrain the model
+            if traded_days_count % retrain_period == 0:
                 print(f'Retraining model for {market}')
                 
                 settings["TrainedCounts"] = settings["TrainedCounts"] + 1
@@ -158,30 +157,46 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
                 
                 ARCH_model = get_best_arch_model(arima_model)
                 
+                # check if model is valid
+                box_test = sm.stats.acorr_ljungbox(ARCH_model.resid)
+                p_values = box_test[1]
+                confidence_level = 0.05
+                if np.any(p_values > confidence_level):
+                    settings['is_valid_model'][market] = False
+                    
+                # save to settings (actually not really needed, since we don't load the model again)
+                settings['curr_best_arima_model'][market] = arima_model
+                settings['curr_best_arch_model'][market] = ARCH_model
+                
                 # forecast the results for the next 20 days           
                 # https://arch.readthedocs.io/en/latest/univariate/univariate_volatility_forecasting.html
                 # i think this returns the mean of the forecast for the ARIMA + ARCH model
-                arch_forecast = ARCH_model.forecast(horizon=20).mean.iloc[-1]
+                arch_forecast = ARCH_model.forecast(horizon=retrain_period).mean.iloc[-1]
                 print(f'ARCH forecast for mean: {arch_forecast}')
                 # settings['forecasted_returns'][market] = arch_forecast                
 
                 # combine both predictions
-                mu_pred = arima_model.forecast(steps=20)[0]
-                var_pred = ARCH_model.forecast(horizon=20).variance.iloc[-1]
+                mu_pred = arima_model.forecast(steps=retrain_period)[0]
+                var_pred = ARCH_model.forecast(horizon=retrain_period).variance.iloc[-1]
                 forward_20_forecast = mu_pred + var_pred  # very bullish since we assume thatprice will vary upwards only lol
                 settings['forecasted_returns'][market] = forward_20_forecast
                 print(f'variance prediction for {market}: {var_pred}')
                 print(f'Forecasted returns for {market}: {forward_20_forecast}')
                 
             # get the forecasts from the model
-            model_forecast = settings['forecasted_returns'][market][traded_days_count % 20]
+            model_forecast = settings['forecasted_returns'][market][traded_days_count % retrain_period]
             predicted_returns = np.exp(model_forecast) - 1
             print(f'model prediction: {model_forecast}')
             print(f"predicted_returns for {market}: {predicted_returns}")
             
+            # check if forecast exceeds threshold
             if abs(predicted_returns) < threshold:
                 predicted_returns = 0
             
+            # check if model passes box test
+            if not settings['is_valid_model'][market]:
+                predicted_returns = 0
+
             # update position in the given market (i.e buy / sell)
             pos[i] = np.sign(predicted_returns)
         
@@ -199,19 +214,18 @@ def mySettings():
     settings = {}
 
     # S&P 100 stocks
-    # settings['markets']=['CASH','AAPL','ABBV','ABT','ACN','AEP','AIG','ALL',
-    # 'AMGN','AMZN','APA','APC','AXP','BA','BAC','BAX','BK','BMY','BRKB','C',
-    # 'CAT','CL','CMCSA','COF','COP','COST','CSCO','CVS','CVX','DD','DIS','DOW',
-    # 'DVN','EBAY','EMC','EMR','EXC','F','FB','FCX','FDX','FOXA','GD','GE',
-    # 'GILD','GM','GOOGL','GS','HAL','HD','HON','HPQ','IBM','INTC','JNJ','JPM',
-    # 'KO','LLY','LMT','LOW','MA','MCD','MDLZ','MDT','MET','MMM','MO','MON',
-    # 'MRK','MS','MSFT','NKE','NOV','NSC','ORCL','OXY','PEP','PFE','PG','PM',
-    # 'QCOM','RTN','SBUX','SLB','SO','SPG','T','TGT','TWX','TXN','UNH','UNP',
-    # 'UPS','USB','UTX','V','VZ','WAG','WFC','WMT','XOM']
+    settings['markets']=['CASH','AAPL','ABBV','ABT','ACN','AEP','AIG','ALL',
+    'AMGN','AMZN','APA','APC','AXP','BA','BAC','BAX','BK','BMY','BRKB','C',
+    'CAT','CL','CMCSA','COF','COP','COST','CSCO','CVS','CVX','DD','DIS','DOW',
+    'DVN','EBAY','EMC','EMR','EXC','F','FB','FCX','FDX','FOXA','GD','GE',
+    'GILD','GM','GOOGL','GS','HAL','HD','HON','HPQ','IBM','INTC','JNJ','JPM',
+    'KO','LLY','LMT','LOW','MA','MCD','MDLZ','MDT','MET','MMM','MO','MON',
+    'MRK','MS','MSFT','NKE','NOV','NSC','ORCL','OXY','PEP','PFE','PG','PM',
+    'QCOM','RTN','SBUX','SLB','SO','SPG','T','TGT','TWX','TXN','UNH','UNP',
+    'UPS','USB','UTX','V','VZ','WAG','WFC','WMT','XOM']
 
     # Futures Contracts
     # settings['markets'] = ['CASH', 'F_TU', 'F_FV', 'F_TY', 'F_NQ', 'F_US']
-    settings['markets'] = ['F_NQ']
 
     settings['lookback'] = 504
     settings['budget'] = 10**6
@@ -222,8 +236,10 @@ def mySettings():
     settings['threshold'] = 0.01
     settings["TradingDay"] = 0
     settings["TrainedCounts"] = 0
-    settings["curr_best_model"] = {}
+    settings["curr_best_arima_model"] = {}
+    settings['curr_best_arch_model'] = {}
     settings["forecasted_returns"] = {}
+    settings['is_valid_model'] = {}
     return settings
 
 
