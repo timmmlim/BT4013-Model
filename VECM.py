@@ -65,11 +65,12 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, exposure, equity, setting
     def is_serially_correlated(residuals, confidence_level=0.05):
         '''
         helper method to check if residuals are serially correlated, using Box Test
+        null hypothesis: variables are iid (no serial correlation)
     
         '''
         p_values = sm.stats.acorr_ljungbox(residuals)[1]
         
-        if np.any(p_values > confidence_level):
+        if np.any(p_values <= confidence_level):
             return True
         else:
             return False
@@ -145,12 +146,9 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, exposure, equity, setting
         futures_1_is_valid = not is_serially_correlated(futures_1_residuals)
         futures_2_is_valid = not is_serially_correlated(futures_2_residuals)
         
-        # if futures_1_is_valid and futures_2_is_valid:
-        #     settings['is_part_of_cointegrated_pair'][futures_1_name] = True
-        #     settings['is_part_of_cointegrated_pair'][futures_2_name] = True
-        
-        futures_1_is_valid = True
-        futures_2_is_valid = True
+        if futures_1_is_valid and futures_2_is_valid:
+            settings['is_part_of_cointegrated_pair'][futures_1_name] = True
+            settings['is_part_of_cointegrated_pair'][futures_2_name] = True
         
         if futures_1_is_valid and futures_2_is_valid:
             print(f'generating signal for {futures_1_name} and {futures_2_name}')
