@@ -12,6 +12,7 @@ import statsmodels.api as sm
 import statsmodels.tsa.api as tsa
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.tsa.stattools import acf, q_stat, adfuller
+from statsmodels.stats.diagnostic import het_arch
 
 from sklearn.metrics import mean_squared_error
 
@@ -45,19 +46,20 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
 
         return int(best_p), int(best_d), int(best_q)
     
-    def get_best_q(test_results={}, best_model_criteria="BIC"):
+    def get_best_p_q(test_results={}, best_model_criteria="BIC"):
         # helper function to get best order for ARCH model
         # convert to dataframe
         test_results_df = pd.DataFrame(test_results).T
         test_results_df.columns = ['AIC', 'BIC']
-        test_results_df.index.names = ['q']
+        test_results_df.index.names = ['p', 'q']
         test_results_df = test_results_df.reset_index()
 
         # find p,d,q that gives the minimum criteria
         index = np.argmin(test_results_df[best_model_criteria])
         best_q = test_results_df.iloc[index]['q']
+        best_p = test_results_df.iloc[index]['p']
 
-        return int(best_q)
+        return int(best_p), int(best_q)
 
     def get_best_arima_model(data, max_p=3, max_d=2, max_q=3, criteria="BIC"):
         """
@@ -67,7 +69,7 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
         """
         # test results to keep track of the metrics
         test_results = {}
-        
+
         # iterate through range of possible orders
         for p in range(max_p):
             for q in range(max_q):
@@ -102,19 +104,46 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
         
         return best_model
     
-    def get_best_arch_model(arima_model, max_q=3):
+    def is_serially_correlated(residuals, confidence_level=0.05):
+        '''
+        helper method to check if residuals are serially correlated, using Box Test
+        null hypothesis: variables are iid (no serial correlation)
+    
+        '''
+        p_values = sm.stats.acorr_ljungbox(residuals)[1]
+        
+        if np.any(p_values <= confidence_level):
+            return True
+        else:
+            return False
+    
+    def is_arch_effect_present(residuals, confidence_level=0.05):
+        '''
+        helper method to check if arch effect is present
+        arch effect is defined as serial correlation not being present among residuals
+        but squared residuals show dependence
+        '''
+        is_resid_correlated = is_serially_correlated(residuals, confidence_level)
+        is_squared_resid_correlated = is_serially_correlated(residuals**2, confidence_level)
+        
+        if ~is_resid_correlated and is_squared_resid_correlated:
+            return True
+        return False
+
+    def get_best_arch_model(arima_model, max_q=6, max_p=6):
         test_results = {}
-        for q in range(max_q):
-            model = arch_model(arima_model.resid, q=q, vol='ARCH').fit()
-            
-            aic = model.aic
-            bic = model.bic
-            
-            test_results[q] = [aic, bic]
-            
+        for p in range(max_p):
+            for q in range(max_q):
+                model = arch_model(mean='Zero', y=arima_model.resid, q=q, p=p, vol='GARCH').fit()
+                
+                aic = model.aic
+                bic = model.bic
+                
+                test_results[q] = [aic, bic]
+                
         # get best order
-        best_q = get_best_q(test_results, best_model_criteria='BIC')
-        best_model = arch_model(arima_model.resid, q=best_q, vol='ARCH').fit()
+        best_p, best_q = get_best_p_q(test_results, best_model_criteria='BIC')
+        best_model = arch_model(mean='Zero', y=arima_model.resid, p=best_p, q=best_q, vol='GARCH').fit()
         
         return best_model
  ############################################## END DECLARE FUNCTIONS ################################################
@@ -155,30 +184,27 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
                                             max_d=max_d,
                                             max_q=max_q)
                 
-                ARCH_model = get_best_arch_model(arima_model)
-                
-                # check if model is valid
-                box_test = sm.stats.acorr_ljungbox(ARCH_model.resid)
-                p_values = box_test[1]
-                confidence_level = 0.05
-                if np.any(p_values > confidence_level):
-                    settings['is_valid_model'][market] = False
-                    
-                # save to settings (actually not really needed, since we don't load the model again)
-                settings['curr_best_arima_model'][market] = arima_model
-                settings['curr_best_arch_model'][market] = ARCH_model
-                
-                # forecast the results for the next 20 days           
-                # https://arch.readthedocs.io/en/latest/univariate/univariate_volatility_forecasting.html
-                # i think this returns the mean of the forecast for the ARIMA + ARCH model
-                arch_forecast = ARCH_model.forecast(horizon=retrain_period).mean.iloc[-1]
-                print(f'ARCH forecast for mean: {arch_forecast}')
-                # settings['forecasted_returns'][market] = arch_forecast                
-
-                # combine both predictions
                 mu_pred = arima_model.forecast(steps=retrain_period)[0]
-                var_pred = ARCH_model.forecast(horizon=retrain_period).variance.iloc[-1]
-                forward_20_forecast = mu_pred + var_pred  # very bullish since we assume thatprice will vary upwards only lol
+                settings['curr_best_arima_model'][market] = arima_model
+                var_pred = 0
+
+                if is_arch_effect_present(arima_model.resid, confidence_level=0.15):
+                    # if ARCH effect present, fit GARCH model
+                    garch_model = get_best_arch_model(arima_model)
+                
+                    # check if model is valid
+                    settings['is_valid_model'][market] = is_serially_correlated(garch_model.resid)
+                    garch_forecast = garch_model.forecast(horizon=retrain_period).mean.iloc[-1]
+                    print(f'GARCH forecast for mean: {garch_forecast}')
+                    
+                    # save to settings (actually not really needed, since we don't load the model again)
+                    settings['curr_best_garch_model'][market] = garch_model
+                    var_pred = garch_model.forecast(horizon=retrain_period).variance.iloc[-1]
+
+                else:
+                    settings['is_valid_model'][market] = is_serially_correlated(arima_model.resid)
+
+                forward_20_forecast = mu_pred + var_pred
                 settings['forecasted_returns'][market] = forward_20_forecast
                 print(f'variance prediction for {market}: {var_pred}')
                 print(f'Forecasted returns for {market}: {forward_20_forecast}')
@@ -235,7 +261,7 @@ def mySettings():
     settings["TradingDay"] = 0
     settings["TrainedCounts"] = 0
     settings["curr_best_arima_model"] = {}
-    settings['curr_best_arch_model'] = {}
+    settings['curr_best_garch_model'] = {}
     settings["forecasted_returns"] = {}
     settings['is_valid_model'] = {}
     return settings
