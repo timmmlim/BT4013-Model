@@ -210,6 +210,7 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
                 print(f'Forecasted returns for {market}: {forward_20_forecast}')
                 
             # get the forecasts from the model
+            print(f'Day in cycle: {traded_days_count % retrain_period}')
             model_forecast = settings['forecasted_returns'][market][traded_days_count % retrain_period]
             predicted_returns = np.exp(model_forecast) - 1
             print(f'model prediction: {model_forecast}')

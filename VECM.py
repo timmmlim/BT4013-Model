@@ -10,6 +10,7 @@ from numpy.linalg import LinAlgError
 
 import statsmodels.api as sm
 import statsmodels.tsa.api as tsa
+from statsmodels.tsa.vector_ar.vecm import select_coint_rank, select_order
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.tsa.stattools import acf, q_stat, adfuller
 
@@ -53,7 +54,10 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, exposure, equity, setting
         '''
         if is_order_1(series_1) and is_order_1(series_2):
             try:
-                _, pvalue, _ = tsa.coint(series_1, series_2)  # try johansen cointegration next
+                # tsa.coint uses engle-granger 2-step test for cointegration
+                # regresses one variable on other and checks if result is stationary
+
+                _, pvalue, _ = tsa.coint(series_1, series_2)
                 if pvalue <= confidence_level:
                     return True
             except:
@@ -68,12 +72,13 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, exposure, equity, setting
         null hypothesis: variables are iid (no serial correlation)
     
         '''
-        p_values = sm.stats.acorr_ljungbox(residuals)[1]
+        lags = int(np.log(len(residuals)))
+        p_values = sm.stats.acorr_ljungbox(residuals, lags=lags)[1]
         
-        if np.any(p_values <= confidence_level):
-            return True
-        else:
+        if np.any(p_values > confidence_level):
             return False
+        else:
+            return True
     
     
     def get_pairs(lst_of_futures):
@@ -100,11 +105,16 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, exposure, equity, setting
         return cointegrated_pairs
      ############################################## END DECLARE FUNCTIONS ################################################
     
-    markets = settings['markets']
-    train_length = settings['train_length']
+    markets = settings['markets']  # don't include cash as the search
     pos = np.zeros(len(markets), dtype=np.float)
     pairs = get_pairs([i[0] for i in enumerate(markets)])
     cointegrated_pairs = get_cointegrated_pairs(pairs)  # returns the indexes of pairs that are cointegrated
+    is_part_of_cointegrated_pair_dict = settings['is_part_of_cointegrated_pair']  # all should be False at the start of each cycle
+    
+    for k in is_part_of_cointegrated_pair_dict.keys():
+        is_part_of_cointegrated_pair_dict[k] = False
+    
+    print(f'is_part_of_cointegrated_pair_dict: {is_part_of_cointegrated_pair_dict}')
     print(f'Cointegrated pairs: {cointegrated_pairs}')
     
     # we look for cointegrated pairs everyday
@@ -115,7 +125,7 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, exposure, equity, setting
         futures_1_name = markets[futures_1_index]
         futures_2_name = markets[futures_2_index]
         
-        if settings['is_part_of_cointegrated_pair'][futures_1_name] or settings['is_part_of_cointegrated_pair'][futures_2_name]:
+        if is_part_of_cointegrated_pair_dict[futures_1_name] or is_part_of_cointegrated_pair_dict[futures_2_name]:
             continue
         
         print(f'checking {futures_1_name} and {futures_2_name} now')
@@ -131,7 +141,10 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, exposure, equity, setting
         #print(f'data for {futures_1_name} and {futures_2_name}')
         #print(data)
         
-        vecm = tsa.VECM(endog=data, k_ar_diff=2, coint_rank=1)  # TODO: optimize selection of k_ar_diff by using AIC method on VAR model
+        # bivariate model -> use 1 cointegrating r/s
+        # lag_length = select_order(data=data, maxlags=10).selected_orders['aic']
+        vecm = tsa.VECM(endog=data, k_ar_diff=3, coint_rank=1)  # TODO: optimize selection of k_ar_diff by using AIC method on VAR model
+        
         try:
             vecm_fit = vecm.fit()
         except LinAlgError:
@@ -143,17 +156,16 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, exposure, equity, setting
         futures_2_residuals = [residuals[1] for residuals in vecm_fit.resid]
         
         # check if model is valid
-        futures_1_is_valid = not is_serially_correlated(futures_1_residuals)
-        futures_2_is_valid = not is_serially_correlated(futures_2_residuals)
+        is_part_of_cointegrated_pair_dict[futures_1_name] = not is_serially_correlated(futures_1_residuals)
+        is_part_of_cointegrated_pair_dict[futures_2_name] = not is_serially_correlated(futures_2_residuals)
         
-        if futures_1_is_valid and futures_2_is_valid:
-            settings['is_part_of_cointegrated_pair'][futures_1_name] = True
-            settings['is_part_of_cointegrated_pair'][futures_2_name] = True
-        
-        if futures_1_is_valid and futures_2_is_valid:
+        # if model fits, generate prediction
+        if is_part_of_cointegrated_pair_dict[futures_1_name] and is_part_of_cointegrated_pair_dict[futures_2_name]:
             print(f'generating signal for {futures_1_name} and {futures_2_name}')
             alpha = vecm_fit.alpha
             beta = np.transpose(vecm_fit.beta)
+            print(f'alpha: {alpha}')
+            print(f'beta: {beta}')
             
             # long run relationship
             futures_1_today_price = futures_1_close_price[-1]
@@ -161,17 +173,34 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, exposure, equity, setting
             long_run = np.dot(beta, [futures_1_today_price, futures_2_today_price])
             print(f'long run: {long_run}')
             
-            # not sure about this part for now
-            if long_run > 0:
-                # short both
-                pos[futures_1_index] = -1
-                pos[futures_2_index] = -1
+            # predict returns
+            prediction = vecm_fit.predict(steps=1)[0]
+            futures_1_prediction = prediction[0]
+            futures_2_prediction = prediction[1]
+            
+            print(f'prediction for {futures_1_name}, {futures_2_name}: {futures_1_prediction}, {futures_2_prediction}')
+            if abs(futures_1_prediction) > settings['threshold']:
+                pos[futures_1_index] = np.sign(futures_1_prediction)
+            
+            if abs(futures_2_prediction) > settings['threshold']:
+                pos[futures_2_index] = np.sign(futures_2_prediction)
                 
-            if long_run < 0:
-                # long both
-                pos[futures_1_index] = 1
-                pos[futures_2_index] = 1            
+            # # not sure about this part for now
+            # if long_run > 0:
+            #     # short both
+            #     pos[futures_1_index] = -1
+            #     pos[futures_2_index] = -1
+
+            # if long_run < 0:
+            #     # long both
+            #     pos[futures_1_index] = 1
+            #     pos[futures_2_index] = 1
     
+    # set cash to be 30% of holdings
+    # curr_total = np.sum(np.abs(pos))
+    # pos[-1] = curr_total * (0.3/0.7)
+    print(f'positions: {pos}')
+
     return pos, settings
         
 def mySettings():
@@ -188,14 +217,15 @@ def mySettings():
                     'F_AH', 'F_DZ', 'F_FB', 'F_FM', 'F_FY', 'F_NY', 'F_PQ', 'F_SH', 'F_SX', 'F_GD']
 
     bond_futures = ['F_FV', 'F_TU', 'F_TY', 'F_US']
-    
-    settings['markets']  = currency_futures  # test on currency futures first
-    settings['beginInSample'] = '20171017'  # backtesting starts settings[lookback] days after period
-    settings['endInSample'] = '20200131'
+        
+    #settings['markets']  = currency_futures + ['CASH']
+    settings['markets'] = currency_futures + bond_futures
+    settings['beginInSample'] = '20171001'  # backtesting starts settings[lookback] days after period
+    settings['endInSample'] = '20191231'
     settings['lookback']= 504
     settings['budget']= 10**6
     settings['slippage']= 0.05
-    settings['train_length'] = 252  # the amt of data we fit the model on
+    settings['threshold'] = 0.01
     
     is_part_of_cointegrated_pair_dict = {}
     for future in settings['markets']:
