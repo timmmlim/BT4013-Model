@@ -75,10 +75,10 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, exposure, equity, setting
         lags = int(np.log(len(residuals)))
         p_values = sm.stats.acorr_ljungbox(residuals, lags=lags)[1]
         
-        if np.any(p_values > confidence_level):
-            return False
-        else:
+        if np.any(p_values <= confidence_level):
             return True
+        else:
+            return False
     
     
     def get_pairs(lst_of_futures):

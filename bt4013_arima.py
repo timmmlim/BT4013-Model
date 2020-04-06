@@ -74,7 +74,6 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
         for p in range(max_p):
             for q in range(max_q):
                 for d in range(max_d):
-                    print(f"p, d, q: {p, d, q}")
                     aic, bic = 10000, 10000
                     if p == 0 and q == 0:
                         continue
@@ -110,7 +109,8 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
         null hypothesis: variables are iid (no serial correlation)
     
         '''
-        p_values = sm.stats.acorr_ljungbox(residuals)[1]
+        lags = int(np.log(len(residuals)))
+        p_values = sm.stats.acorr_ljungbox(residuals, lags=lags)[1]
         
         if np.any(p_values <= confidence_level):
             return True
@@ -124,11 +124,9 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
         but squared residuals show dependence
         '''
         is_resid_correlated = is_serially_correlated(residuals, confidence_level)
-        is_squared_resid_correlated = is_serially_correlated(residuals**2, confidence_level)
+        is_resid_squared_correlated = is_serially_correlated(residuals ** 2, confidence_level)
+        return (~is_resid_correlated and is_resid_squared_correlated)
         
-        if ~is_resid_correlated and is_squared_resid_correlated:
-            return True
-        return False
 
     def get_best_arch_model(arima_model, max_q=6, max_p=6):
         test_results = {}
@@ -143,7 +141,7 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
                 
         # get best order
         best_p, best_q = get_best_p_q(test_results, best_model_criteria='BIC')
-        best_model = arch_model(mean='Zero', y=arima_model.resid, p=best_p, q=best_q, vol='GARCH').fit()
+        best_model = arch_model(mean='Zero', y=arima_model.resid, p=best_p, q=best_q, vol='GARCH', rescale=True).fit()
         
         return best_model
  ############################################## END DECLARE FUNCTIONS ################################################
@@ -161,9 +159,9 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
     for i, market in enumerate(markets):
 
         ##### i converted the prices to pandas, because i find it easier to work with, not sure if it slows down the shit #####
-        try:
-            # only use most recent year of data
-            CURR_CLOSE = pd.Series(CLOSE[-252:, i]).dropna()
+        try:            
+            window = 10
+            CURR_CLOSE = pd.Series(CLOSE[-window:, i]).dropna()
             DAILY_RETURN = CURR_CLOSE.pct_change().dropna()
 
             # calculate log returns
@@ -171,13 +169,13 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
             
             retrain_period = 10  # period to retrain the model
             if traded_days_count % retrain_period == 0:
+                settings['forecasted_returns'][market] = np.zeros(retrain_period)
                 print(f'Retraining model for {market}')
-                
+                settings['is_valid_model'][market] = False
                 settings["TrainedCounts"] = settings["TrainedCounts"] + 1
-                train_size = 450
-                max_p = 3
-                max_q = 3
-                max_d = 3
+                max_p = 5
+                max_q = 5
+                max_d = 2
                 
                 arima_model = get_best_arima_model(data=LOG_DAILY_RETURN, # LOG_RETURN IS SERIES
                                             max_p=max_p,
@@ -185,29 +183,25 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
                                             max_q=max_q)
                 
                 mu_pred = arima_model.forecast(steps=retrain_period)[0]
-                settings['curr_best_arima_model'][market] = arima_model
                 var_pred = 0
-
+                
+                garch_forecast = None
                 if is_arch_effect_present(arima_model.resid, confidence_level=0.15):
                     # if ARCH effect present, fit GARCH model
                     garch_model = get_best_arch_model(arima_model)
                 
                     # check if model is valid
                     settings['is_valid_model'][market] = is_serially_correlated(garch_model.resid)
-                    garch_forecast = garch_model.forecast(horizon=retrain_period).mean.iloc[-1]
+                    garch_forecast = garch_model.forecast(horizon=retrain_period).mean.iloc[-1]  / garch_model.scale # overwrite None variable
                     print(f'GARCH forecast for mean: {garch_forecast}')
                     
-                    # save to settings (actually not really needed, since we don't load the model again)
-                    settings['curr_best_garch_model'][market] = garch_model
-                    var_pred = garch_model.forecast(horizon=retrain_period).variance.iloc[-1]
-
                 else:
                     settings['is_valid_model'][market] = is_serially_correlated(arima_model.resid)
-
-                forward_20_forecast = mu_pred + var_pred
-                settings['forecasted_returns'][market] = forward_20_forecast
-                print(f'variance prediction for {market}: {var_pred}')
-                print(f'Forecasted returns for {market}: {forward_20_forecast}')
+                                
+                if garch_forecast:
+                    settings['forecasted_returns'][market] = garch_forecast
+                else:
+                    settings['forecasted_returns'][market] = mu_pred  # use arima pred
                 
             # get the forecasts from the model
             print(f'Day in cycle: {traded_days_count % retrain_period}')
@@ -241,28 +235,27 @@ def mySettings():
     settings = {}
 
     # Futures Contracts
-    settings['markets'] = ['F_AD','F_BO','F_BP','F_C','F_CC','F_CD','F_CL','F_CT','F_DX','F_EC',
-                           'F_ED','F_ES','F_FC','F_FV','F_GC','F_HG','F_HO','F_JY','F_KC','F_LB',
-                           'F_LC','F_LN','F_MD','F_MP','F_NG','F_NQ','F_NR','F_O','F_OJ','F_PA',
-                           'F_PL','F_RB','F_RU','F_S','F_SB','F_SF','F_SI','F_SM','F_TU','F_TY','F_US',
-                           'F_W','F_XX','F_YM','F_AX','F_CA','F_DT','F_UB','F_UZ','F_GS','F_LX','F_SS','F_DL',
-                           'F_ZQ','F_VX','F_AE','F_BG','F_BC','F_LU','F_DM','F_AH','F_CF','F_DZ','F_FB','F_FL',
-                           'F_FM','F_FP','F_FY','F_GX','F_HP','F_LR','F_LQ','F_ND','F_NY','F_PQ','F_RR','F_RF','F_RP',
-                           'F_RY','F_SH','F_SX','F_TR','F_EB','F_VF','F_VT','F_VW','F_GD','F_F']
 
-    # settings['markets'] = ['CASH', 'F_TU', 'F_FV', 'F_TY', 'F_NQ', 'F_US']
+    currency_futures = ['F_AD', 'F_BP', 'F_CD', 'F_DX', 'F_EC', 'F_JY', 'F_MP', 
+                    'F_SF', 'F_LR', 'F_ND', 'F_RR', 'F_RF', 'F_RP', 'F_TR']
+    
+    index_futures = ['F_ES', 'F_MD', 'F_NQ', 'F_RU', 'F_XX', 'F_YM', 'F_AX', 'F_CA', 'F_LX', 'F_VX', 'F_AE', 'F_DM',
+                    'F_AH', 'F_DZ', 'F_FB', 'F_FM', 'F_FY', 'F_NY', 'F_PQ', 'F_SH', 'F_SX', 'F_GD']
+
+    bond_futures = ['F_FV', 'F_TU', 'F_TY', 'F_US']
+        
+    #settings['markets']  = currency_futures + ['CASH']
+    settings['markets'] = currency_futures
 
     settings['lookback'] = 504
     settings['budget'] = 10**6
     settings['slippage'] = 0.05
-    settings['beginInSample'] = '20171017'  # backtesting starts settings[lookback] days after period
-    settings['endInSample'] = '20200131'
+    settings['beginInSample'] = '20171001'  # backtesting starts settings[lookback] days after period
+    settings['endInSample'] = '20191231'
 
-    settings['threshold'] = 0.01  # probably need to set lower, since the forecasted values are all close to 0
+    settings['threshold'] = 0.001  # probably need to set lower, since the forecasted values are all close to 0
     settings["TradingDay"] = 0
     settings["TrainedCounts"] = 0
-    settings["curr_best_arima_model"] = {}
-    settings['curr_best_garch_model'] = {}
     settings["forecasted_returns"] = {}
     settings['is_valid_model'] = {}
     return settings
