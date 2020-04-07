@@ -1,8 +1,7 @@
 import os
 import sys
 import warnings
-from datetime import date
-
+import datetime as dt
 import pandas as pd
 
 import numpy as np
@@ -10,16 +9,9 @@ from numpy.linalg import LinAlgError
 
 import statsmodels.api as sm
 import statsmodels.tsa.api as tsa
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-from statsmodels.tsa.stattools import acf, q_stat, adfuller
-from statsmodels.stats.diagnostic import het_arch
-
-from sklearn.metrics import mean_squared_error
-
-from scipy.stats import probplot, moment
-
 from arch import arch_model
-from arch.univariate import ConstantMean, GARCH, Normal
+
+import pickle
 
 # fitler statsmodel convergence warning ; already handled
 # warnings.simplefilter('once', category=UserWarning)
@@ -126,7 +118,6 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
         is_resid_correlated = is_serially_correlated(residuals, confidence_level)
         is_resid_squared_correlated = is_serially_correlated(residuals ** 2, confidence_level)
         return (~is_resid_correlated and is_resid_squared_correlated)
-        
 
     def get_best_arch_model(arima_model, max_q=6, max_p=6):
         test_results = {}
@@ -144,18 +135,6 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
         best_model = arch_model(mean='Zero', y=arima_model.resid, p=best_p, q=best_q, vol='GARCH', rescale=True).fit()
         
         return best_model
-    
-    def get_one_step_forecast(model, new_data):
-        if type(model) == ConstantMean:  # means garch model
-            original_data = model.y.to_list()
-            updated_data = original_data.append(new_data)
-            new_model = model(mean='Zero', y=updated_data)
-            forecast = model.forecast(params=model.params, horizon=1)  # forecast using the original params
-        else:  # TODO for arima model
-            original_data = model.model.endog
-            updated_data = original_data.append(new_data)
-            model.model.endog = updated_data              
-        
  ############################################## END DECLARE FUNCTIONS ################################################
 
     # Get parameters from setting
@@ -172,14 +151,14 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
 
         ##### i converted the prices to pandas, because i find it easier to work with, not sure if it slows down the shit #####
         try:            
-            window = 10
+            window = 5
             CURR_CLOSE = pd.Series(CLOSE[-window:, i]).dropna()
             DAILY_RETURN = CURR_CLOSE.pct_change().dropna()
 
             # calculate log returns
             LOG_DAILY_RETURN = np.log(DAILY_RETURN + 1)
             
-            retrain_period = 20  # period to retrain the model
+            retrain_period = 10  # period to retrain the model
             if traded_days_count % retrain_period == 0:
                 settings['forecasted_returns'][market] = np.zeros(retrain_period)
                 print(f'Retraining model for {market}')
@@ -193,36 +172,43 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
                                             max_p=max_p,
                                             max_d=max_d,
                                             max_q=max_q)
-                                
+                
+                mu_pred = arima_model.forecast(steps=retrain_period)[0]
+                var_pred = 0
+                
+                garch_forecast = None
                 if is_arch_effect_present(arima_model.resid, confidence_level=0.15):
                     # if ARCH effect present, fit GARCH model
                     garch_model = get_best_arch_model(arima_model)
+                
                     # check if model is valid
-                    garch_model_valid = not is_serially_correlated(garch_model.resid)
+                    settings['is_valid_model'][market] = ~is_serially_correlated(garch_model.resid)
+                    garch_forecast = garch_model.forecast(horizon=retrain_period).mean.iloc[-1]  / garch_model.scale # overwrite None variable
+                    print(f'GARCH forecast for mean: {garch_forecast}')
                     
-                    if garch_model_valid:
-                        settings['model'][market] = garch_model
-                        settings['is_valid_model'][market] = True
-                        
-                elif not is_serially_correlated(arima_model.resid):
-                    settings['is_valid_model'][market] = True
-                    settings['model'][market] = arima_model
                 else:
-                    settings['is_valid_model'][market] = False
+                    settings['is_valid_model'][market] = ~is_serially_correlated(arima_model.resid)
+                                
+                if garch_forecast:
+                    settings['forecasted_returns'][market] = garch_forecast
+                else:
+                    settings['forecasted_returns'][market] = mu_pred  # use arima pred
                 
             # get the forecasts from the model
-            if settings['is_valid_model'][market]:
-                model = settings['model'][market]
-                predicted_returns = get_one_step_forecast(model, LOG_DAILY_RETURN[len(LOG_DAILY_RETURN)])
+            print(f'Day in cycle: {traded_days_count % retrain_period}')
+            model_forecast = settings['forecasted_returns'][market][traded_days_count % retrain_period]
+            predicted_returns = np.exp(model_forecast) - 1
+            print(f'model prediction: {model_forecast}')
+            print(f"predicted_returns for {market}: {predicted_returns}")
             
-            # check if model passes box test
-            if not settings['is_valid_model'][market]:
-                predicted_returns = 0
-                
             # check if forecast exceeds threshold
             if abs(predicted_returns) < threshold:
                 predicted_returns = 0
             
+            # check if model passes box test
+            if not settings['is_valid_model'][market]:
+                predicted_returns = 0
+
             # update position in the given market (i.e buy / sell)
             pos[i] = np.sign(predicted_returns)
         
@@ -263,7 +249,6 @@ def mySettings():
     settings["TrainedCounts"] = 0
     settings["forecasted_returns"] = {}
     settings['is_valid_model'] = {}
-    settings['model'] = {}
     return settings
 
 
