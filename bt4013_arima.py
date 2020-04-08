@@ -137,7 +137,7 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
                 aic = model.aic
                 bic = model.bic
                 
-                test_results[q] = [aic, bic]
+                test_results[(p, q)] = [aic, bic]
                 
         # get best order
         best_p, best_q = get_best_p_q(test_results, best_model_criteria='BIC')
@@ -146,15 +146,35 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
         return best_model
     
     def get_one_step_forecast(model, new_data):
-        if type(model) == ConstantMean:  # means garch model
-            original_data = model.y.to_list()
-            updated_data = original_data.append(new_data)
-            new_model = model(mean='Zero', y=updated_data)
-            forecast = model.forecast(params=model.params, horizon=1)  # forecast using the original params
-        else:  # TODO for arima model
-            original_data = model.model.endog
-            updated_data = original_data.append(new_data)
-            model.model.endog = updated_data              
+        """Input:
+            model: Either ARIMA or GARCH
+            new_data: the entire new log returns data
+        """
+
+        if str(type(model)) == "<class 'arch.univariate.base.ARCHModelResult'>":  # means garch model
+            # update arima to get residual
+            old_params = arima_model.params
+            old_order = (len(arima_model.arparams), len(arima_model.maparams))
+            new_arima_model = tsa.ARMA(new_data, order = old_order).fit(start_params= old_params, max_iter = 0) # value changes a bit
+
+            # update garch model
+            old_garch_params = model.params
+            new_updated_residual = new_arima_model.resid
+            new_model = arch_model(mean='Zero', y=new_updated_residual,vol='GARCH', rescale=True).fit(starting_values = old_garch_params,
+                                                                           update_freq = 0, 
+                                                                           disp = 'off')
+            ## Question: but variance? or mean
+            forecast = new_model.forecast(horizon=1).variance  # forecast using the original params 
+
+        else:
+            # update arima to get residual
+            old_params = model.params
+            old_order = (len(arima_model.arparams), len(arima_model.maparams))
+            new_arima_model = tsa.ARIMA(new_data, order = old_order).fit(start_params= old_params, max_iter = 0) # value changes a bit
+            forecast, _, _ = new_arima_model.forecast(steps=1)
+            forecast = forecast[0] 
+        
+        return forecast            
         
  ############################################## END DECLARE FUNCTIONS ################################################
 
@@ -213,7 +233,8 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
             # get the forecasts from the model
             if settings['is_valid_model'][market]:
                 model = settings['model'][market]
-                predicted_returns = get_one_step_forecast(model, LOG_DAILY_RETURN[len(LOG_DAILY_RETURN)])
+                new_data = LOG_DAILY_RETURN[len(LOG_DAILY_RETURN)]
+                predicted_returns = get_one_step_forecast(model, new_data)
             
             # check if model passes box test
             if not settings['is_valid_model'][market]:

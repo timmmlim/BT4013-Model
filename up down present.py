@@ -1,7 +1,8 @@
 import os
 import sys
 import warnings
-import datetime as dt
+from datetime import date
+
 import pandas as pd
 
 import numpy as np
@@ -9,10 +10,16 @@ from numpy.linalg import LinAlgError
 
 import statsmodels.api as sm
 import statsmodels.tsa.api as tsa
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.stattools import acf, q_stat, adfuller
+from statsmodels.stats.diagnostic import het_arch
+
+from sklearn.metrics import mean_squared_error
+
+from scipy.stats import probplot, moment
+
 from arch import arch_model
-
 import pickle
-
 # fitler statsmodel convergence warning ; already handled
 # warnings.simplefilter('once', category=UserWarning)
 from warnings import filterwarnings
@@ -90,7 +97,7 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
         print(f"Best p: {best_p}, Best d: {best_d}, Best q: {best_q}")
         
         # Fit ARMA with best order
-        best_model = tsa.ARMA(endog=data, order=(best_p, best_q)).fit()
+        best_model = tsa.ARIMA(endog=data, order=(best_p, best_d, best_q)).fit()
         print(f"Model Params: {best_model.params}")
         
         return best_model
@@ -118,23 +125,70 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
         is_resid_correlated = is_serially_correlated(residuals, confidence_level)
         is_resid_squared_correlated = is_serially_correlated(residuals ** 2, confidence_level)
         return (~is_resid_correlated and is_resid_squared_correlated)
+        
 
     def get_best_arch_model(arima_model, max_q=6, max_p=6):
         test_results = {}
-        for p in range(max_p):
+        for p in range(1, max_p):
             for q in range(max_q):
-                model = arch_model(mean='Zero', y=arima_model.resid, q=q, p=p, vol='GARCH').fit()
+                print(p, q)
+                model = arch_model(mean='Zero', y=arima_model.resid, q=q, p=p, vol='GARCH', rescale=True).fit()
                 
                 aic = model.aic
                 bic = model.bic
                 
-                test_results[q] = [aic, bic]
+                test_results[(p, q)] = [aic, bic]
                 
         # get best order
         best_p, best_q = get_best_p_q(test_results, best_model_criteria='BIC')
         best_model = arch_model(mean='Zero', y=arima_model.resid, p=best_p, q=best_q, vol='GARCH', rescale=True).fit()
         
         return best_model
+    
+    def get_one_step_forecast(model, new_data):
+        """Input:
+            model: Either ARIMA or GARCH
+            new_data: the entire new log returns data
+        """
+        try:
+            if str(type(model)) == "<class 'arch.univariate.base.ARCHModelResult'>":  # means garch model
+                # update arima to get residual
+                arima_model = settings['arima_model'][market]
+                old_params = arima_model.params
+                old_order = (len(arima_model.arparams), len(arima_model.maparams))
+                new_arima_model = tsa.ARMA(new_data, order = old_order).fit(start_params= old_params, max_iter = 0)  # assume ARMA, d=0
+    
+                # update garch model
+                old_garch_params = model.params
+                new_updated_residual = new_arima_model.resid
+                new_model = arch_model(mean='Zero', y=new_updated_residual,vol='GARCH', rescale=True).fit(starting_values = old_garch_params,
+                                                                               update_freq = 0, 
+                                                                               disp = 'off')
+                ## Question: but variance? or mean
+                forecast = new_model.forecast(horizon=1).mean.iloc[-1] / new_model.scale # forecast using the original params 
+    
+            else:
+                # update arima to get residual
+                old_params = model.params
+                old_order = (len(model.arparams), len(model.maparams))
+                new_arima_model = tsa.ARMA(new_data, order = old_order).fit(start_params= old_params, max_iter = 0)
+                forecast, _, _ = new_arima_model.forecast(steps=1)
+                forecast = forecast[0]
+        
+        except:
+            forecast = 0 
+        
+        return forecast
+
+    def get_pre_trained_forecast(lst_of_models, new_data):
+        forecast_sum = 0
+        for model in lst_of_models:
+            model_forecast = get_one_step_forecast(model, new_data)
+            model_forecast = np.exp(model_forecast) - 1  # transform back to daily return
+            forecast_sum += model_forecast
+        avg_forecast = forecast_sum/len(lst_of_models)
+        return avg_forecast
+
  ############################################## END DECLARE FUNCTIONS ################################################
 
     # Get parameters from setting
@@ -143,24 +197,21 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
     threshold = settings['threshold']
     traded_days_count = settings["TradingDay"]  # traded_days to indicate when should we re-run the model
 
-
     pos = np.zeros(len(markets), dtype=np.float)
 
     # For each market
     for i, market in enumerate(markets):
 
-        ##### i converted the prices to pandas, because i find it easier to work with, not sure if it slows down the shit #####
         try:            
-            window = 5
+            window = 10
             CURR_CLOSE = pd.Series(CLOSE[-window:, i]).dropna()
             DAILY_RETURN = CURR_CLOSE.pct_change().dropna()
 
             # calculate log returns
             LOG_DAILY_RETURN = np.log(DAILY_RETURN + 1)
-            
+
             retrain_period = 10  # period to retrain the model
             if traded_days_count % retrain_period == 0:
-                settings['forecasted_returns'][market] = np.zeros(retrain_period)
                 print(f'Retraining model for {market}')
                 settings['is_valid_model'][market] = False
                 settings["TrainedCounts"] = settings["TrainedCounts"] + 1
@@ -172,43 +223,79 @@ def myTradingSystem(DATE, OPEN, HIGH, LOW, CLOSE, VOL, OI, P, R, RINFO, exposure
                                             max_p=max_p,
                                             max_d=max_d,
                                             max_q=max_q)
+                settings['arima_model'][market] = arima_model
                 
-                mu_pred = arima_model.forecast(steps=retrain_period)[0]
-                var_pred = 0
-                
-                garch_forecast = None
-                if is_arch_effect_present(arima_model.resid, confidence_level=0.15):
+                if is_arch_effect_present(arima_model.resid, confidence_level=0.1):
                     # if ARCH effect present, fit GARCH model
                     garch_model = get_best_arch_model(arima_model)
-                
                     # check if model is valid
-                    settings['is_valid_model'][market] = ~is_serially_correlated(garch_model.resid)
-                    garch_forecast = garch_model.forecast(horizon=retrain_period).mean.iloc[-1]  / garch_model.scale # overwrite None variable
-                    print(f'GARCH forecast for mean: {garch_forecast}')
                     
+                    settings['model'][market] = garch_model
+                    settings['is_valid_model'][market] = not is_serially_correlated(garch_model.resid)
+                        
                 else:
-                    settings['is_valid_model'][market] = ~is_serially_correlated(arima_model.resid)
-                                
-                if garch_forecast:
-                    settings['forecasted_returns'][market] = garch_forecast
-                else:
-                    settings['forecasted_returns'][market] = mu_pred  # use arima pred
-                
+                    settings['is_valid_model'][market] = not is_serially_correlated(arima_model.resid)
+                    settings['model'][market] = arima_model
+                    
             # get the forecasts from the model
-            print(f'Day in cycle: {traded_days_count % retrain_period}')
-            model_forecast = settings['forecasted_returns'][market][traded_days_count % retrain_period]
-            predicted_returns = np.exp(model_forecast) - 1
-            print(f'model prediction: {model_forecast}')
-            print(f"predicted_returns for {market}: {predicted_returns}")
+            model = settings['model'][market]
+            present_forecast = get_one_step_forecast(model, LOG_DAILY_RETURN)
+            print(f'one step forecast: {present_forecast}')
+            present_forecast = np.exp(present_forecast) - 1  # transform back to return
+            predicted_returns = present_forecast  # init variable first
+            print(f'present forecast: {market} {present_forecast}')
             
-            # check if forecast exceeds threshold
-            if abs(predicted_returns) < threshold:
-                predicted_returns = 0
-            
-            # check if model passes box test
             if not settings['is_valid_model'][market]:
-                predicted_returns = 0
-
+                present_forecast = 0
+                
+            settings['forecasts_by_model']['present'][market] += [present_forecast]
+                
+            # get forecasts from pre-trained models
+            high_models = [model for v in settings['high_models'][market].values() for model in v]  # cos i segregated the arima and garch models in preprocessing
+            low_models = [model for v in settings['low_models'][market].values() for model in v] 
+            
+            high_forecast = get_pre_trained_forecast(high_models, LOG_DAILY_RETURN)  # returns forecast for daily return
+            low_forecast = get_pre_trained_forecast(low_models, LOG_DAILY_RETURN)
+            print(f'high forecast: {high_forecast}')
+            print(f'low forecast: {low_forecast}')
+            
+            settings['forecasts_by_model']['high'][market] += [high_forecast]
+            settings['forecasts_by_model']['low'][market] += [low_forecast]
+            
+            if settings['TradingDay'] > 5:
+                # assume that 'best' is the model that forecasted the direction correctly
+                last_5_days_direction = np.array(np.sign(LOG_DAILY_RETURN[-5:]))
+                high_forecast_list = np.sign(settings['forecasts_by_model']['high'][market][-6:-1])
+                low_forecast_list = np.sign(settings['forecasts_by_model']['low'][market][-6:-1])
+                present_forecast_list = np.sign(settings['forecasts_by_model']['present'][market][-6:-1])
+                
+                score_array = [0, 0, 0]
+                for n in range(len(last_5_days_direction)):
+                    observed = last_5_days_direction[n]
+                    if present_forecast_list[n] == observed:
+                        score_array[0] += 1
+                    if high_forecast_list[n] == observed:
+                        score_array[1] += 1
+                    if low_forecast_list[n] == observed:
+                        score_array[2] += 1
+                        
+                print(f'score array: {score_array}')
+                    
+                # return the highest score
+                max_index = score_array.index(max(score_array))
+                if max_index == 0:
+                    predicted_returns = present_forecast
+                elif max_index == 1:
+                    predicted_returns = high_forecast
+                else:
+                    predicted_returns = low_forecast
+                
+                # check if forecast exceeds threshold
+                print(f'predicted returns: {predicted_returns}')
+                if abs(predicted_returns) < threshold:
+                    print('returns below threshold')
+                    predicted_returns = 0
+                
             # update position in the given market (i.e buy / sell)
             pos[i] = np.sign(predicted_returns)
         
@@ -227,17 +314,15 @@ def mySettings():
 
     # Futures Contracts
 
-    currency_futures = ['F_AD', 'F_BP', 'F_CD', 'F_DX', 'F_EC', 'F_JY', 'F_MP', 
-                    'F_SF', 'F_LR', 'F_ND', 'F_RR', 'F_RF', 'F_RP', 'F_TR']
+    # currency_futures = ['F_AD', 'F_BP', 'F_CD', 'F_DX', 'F_EC', 'F_JY', 'F_MP', 
+    #                 'F_SF', 'F_LR', 'F_ND', 'F_RR', 'F_RF', 'F_RP', 'F_TR']
     
-    index_futures = ['F_ES', 'F_MD', 'F_NQ', 'F_RU', 'F_XX', 'F_YM', 'F_AX', 'F_CA', 'F_LX', 'F_VX', 'F_AE', 'F_DM',
-                    'F_AH', 'F_DZ', 'F_FB', 'F_FM', 'F_FY', 'F_NY', 'F_PQ', 'F_SH', 'F_SX', 'F_GD']
+    # index_futures = ['F_ES', 'F_MD', 'F_NQ', 'F_RU', 'F_XX', 'F_YM', 'F_AX', 'F_CA', 'F_LX', 'F_VX', 'F_AE', 'F_DM',
+    #                 'F_AH', 'F_DZ', 'F_FB', 'F_FM', 'F_FY', 'F_NY', 'F_PQ', 'F_SH', 'F_SX', 'F_GD']
 
-    bond_futures = ['F_FV', 'F_TU', 'F_TY', 'F_US']
-        
-    #settings['markets']  = currency_futures + ['CASH']
-    settings['markets'] = currency_futures
-
+    # bond_futures = ['F_FV', 'F_TU', 'F_TY', 'F_US']
+    settings['markets'] = ['F_GC', 'F_US']
+    #settings['markets'] = ['F_PA', 'F_ED', 'F_GC', 'F_US', 'F_NR', 'F_TU']
     settings['lookback'] = 504
     settings['budget'] = 10**6
     settings['slippage'] = 0.05
@@ -249,6 +334,31 @@ def mySettings():
     settings["TrainedCounts"] = 0
     settings["forecasted_returns"] = {}
     settings['is_valid_model'] = {}
+    settings['model'] = {}
+    settings['arima_model'] = {}
+    settings['forecasts_by_model'] = {'high': {}, 'low': {}, 'present': {}}
+    
+    # init settings['forecasts_by_model]
+    for market in settings['markets']:
+        for key in settings['forecasts_by_model'].keys():
+            settings['forecasts_by_model'][key][market] = []
+    
+    # read pickle
+    objects = []
+    pickle_file_name = 'fitted_time_series.pickle'
+    with (open(pickle_file_name, "rb")) as openfile:
+        while True:
+            try:
+                objects.append(pickle.load(openfile))
+            except EOFError:
+                break
+    
+    settings['high_models'] = objects[0]
+    settings['low_models'] = objects[1]
+    
+    # structure of settings['high_models']
+    # dict{k=future code, v = dict{k=arima/garch, v=list of models}}
+    
     return settings
 
 
